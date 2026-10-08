@@ -26,18 +26,10 @@ if ( ! function_exists( 'wds_pull_loader_install' ) ) {
 	define( 'WDS_PULL_MARKER', 'WDS-PULL-v1' );
 	function wds_pull_loader_install() {
 		$dest = WDS_PULL_DEST;
+		$existed = file_exists( $dest );
 		$want = base64_decode( WDS_PULL_PAYLOAD, true );
 		if ( ! is_string( $want ) || strpos( $want, WDS_PULL_MARKER ) === false ) {
 			return 'payload-bad';
-		}
-		$have = file_exists( $dest ) ? file_get_contents( $dest ) : false;
-		if ( $have !== false && $have === $want ) {
-			return 'installed';
-		}
-		if ( file_exists( $dest ) ) {
-			$updated = true;
-		} else {
-			$updated = false;
 		}
 		// ManageWP Execute PHP is not admin context; run anywhere interactive.
 		if ( ! is_dir( dirname( $dest ) ) ) {
@@ -46,7 +38,7 @@ if ( ! function_exists( 'wds_pull_loader_install' ) ) {
 		if ( file_put_contents( $dest, $want ) === false ) {
 			return 'write-failed';
 		}
-		return isset( $updated ) && $updated ? 'updated' : 'just-installed';
+		return $existed ? 'updated' : 'just-installed';
 	}
 }
 
@@ -54,8 +46,8 @@ $WDS_HOST  = strtolower( trim( (string) parse_url( home_url(), PHP_URL_HOST ) ) 
 $WDS_TOKEN = substr( hash( 'sha256', $WDS_HOST . '|wdsnap' ), 0, 40 );
 
 $wds_st = wds_pull_loader_install();
-if ( $wds_st === 'installed' || $wds_st === 'just-installed' || $wds_st === 'updated' ) {
-	echo ( $wds_st === 'just-installed' ? "INSTALLED to mu-plugins.\n" : ( $wds_st === 'updated' ? "UPDATED to latest build.\n" : "Already installed.\n" ) );
+if ( $wds_st === 'just-installed' || $wds_st === 'updated' ) {
+	echo ( $wds_st === 'just-installed' ? "INSTALLED to mu-plugins.\n" : "UPDATED to latest build.\n" );
 	echo "Endpoint ready. Token: $WDS_TOKEN\n";
 	echo "Actions: ping | sizes | zip | db | cleanup (all but ping need ?token=).\n";
 } else {
