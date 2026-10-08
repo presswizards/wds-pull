@@ -32,6 +32,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 define( 'WDS_PULL_DEST', WP_CONTENT_DIR . '/mu-plugins/wds-pull.php' );
 define( 'WDS_PULL_MARKER', 'WDS-PULL-v1' ); // must appear in installed copy
+define( 'WDS_PULL_VERSION', '1.1' );
 // WDS-PULL-v1
 $WDS_HOST  = strtolower( trim( (string) parse_url( home_url(), PHP_URL_HOST ) ) );
 $WDS_TOKEN = substr( hash( 'sha256', $WDS_HOST . '|wdsnap' ), 0, 40 );
@@ -54,6 +55,17 @@ function wds_pull_json( $data, $code = 200 ) {
 	exit;
 }
 
+function wds_pull_respond( $data, $code = 200 ) {
+	// Echo now and keep running (the request returns while the build
+	// continues detached). wds_pull_json() exits; this does not.
+	header( 'Content-Type: application/json' );
+	status_header( $code );
+	echo json_encode( $data );
+	if ( function_exists( 'flush' ) ) {
+		flush();
+	}
+}
+
 $action = isset( $_GET['wds_action'] ) ? sanitize_key( $_GET['wds_action'] ) : '';
 if ( $action === '' ) {
 	return; // installed copy: inert on normal loads. (First install is done
@@ -65,6 +77,56 @@ if ( $action === 'ping' ) {
 $token = isset( $_GET['token'] ) ? (string) $_GET['token'] : '';
 if ( strlen( $token ) !== 40 || ! hash_equals( $WDS_TOKEN, $token ) ) {
 	wds_pull_json( array( 'error' => 'bad token' ), 403 );
+}
+
+// ---- async job queue: every request answers fast; builds run detached ----
+function wds_job_file( $job ) {
+	global $WDS_TOKEN;
+	$job = preg_replace( '/[^a-z0-9]/', '', strtolower( (string) $job ) );
+	if ( $job === '' ) {
+		return null;
+	}
+	return WP_CONTENT_DIR . '/wdsnap/' . $GLOBALS['WDS_TOKEN'] . '-job-' . $job . '.json';
+}
+function wds_job_read( $job ) {
+	$f = wds_job_file( $job );
+	if ( ! $f || ! file_exists( $f ) ) {
+		return null;
+	}
+	$d = json_decode( file_get_contents( $f ), true );
+	return is_array( $d ) ? $d : null;
+}
+function wds_job_write( $job, $data ) {
+	$f = wds_job_file( $job );
+	if ( ! $f ) {
+		return false;
+	}
+	$data['updated'] = time();
+	return file_put_contents( $f, json_encode( $data ) ) !== false;
+}
+function wds_job_id( $kind, $rel ) {
+	global $WDS_TOKEN;
+	return substr( sha1( $WDS_TOKEN . '|' . $kind . '|' . $rel ), 0, 12 );
+}
+function wds_job_stale( $d ) {
+	// running untouched 30+ min = dead worker; requeueable.
+	return ( $d['state'] ?? '' ) === 'running' && ( time() - (int) ( $d['updated'] ?? 0 ) ) > 1800;
+}
+function wds_detach_and_build( $job, $build_fn ) {
+	// Answer NOW, build after the HTTP connection closes.
+	@set_time_limit( 0 );
+	@ignore_user_abort( true );
+	if ( function_exists( 'fastcgi_finish_request' ) ) {
+		fastcgi_finish_request();
+	}
+	// Re-check state post-detach: another worker may have finished it.
+	$d = wds_job_read( $job );
+	if ( ! $d || ( $d['state'] ?? '' ) !== 'queued' ) {
+		return;
+	}
+	$d['state'] = 'running';
+	wds_job_write( $job, $d );
+	$build_fn( $d );
 }
 
 switch ( $action ) {
@@ -119,6 +181,7 @@ switch ( $action ) {
 		break;
 
 	case 'zip':
+		// Queue a folder build; answers immediately. Poll status, then download.
 		if ( ! function_exists( 'exec' ) ) {
 			wds_pull_json( array( 'error' => 'exec disabled on this host' ), 500 );
 		}
@@ -126,82 +189,122 @@ switch ( $action ) {
 		if ( $rel === '' || strpos( $rel, '..' ) !== false || strpos( $rel, './' ) !== false ) {
 			wds_pull_json( array( 'error' => 'bad path' ), 400 );
 		}
-		$src = WP_CONTENT_DIR . '/' . $rel;
-		if ( ! file_exists( $src ) ) {
+		if ( ! file_exists( WP_CONTENT_DIR . '/' . $rel ) ) {
 			wds_pull_json( array( 'error' => 'path not found' ), 404 );
 		}
-		$safe = preg_replace( '/[^a-zA-Z0-9_-]/', '_', $rel );
-		$dest = $snap_dir . '/' . $WDS_TOKEN . '-' . $safe . '.zip';
-		@unlink( $dest );
-		// -rq: recursive, quiet; -9 best compression; -y store symlinks.
-		$cmd = sprintf(
-			'cd %s && zip -rq -9 %s %s > /dev/null 2>&1',
-			escapeshellarg( WP_CONTENT_DIR ),
-			escapeshellarg( $dest ),
-			escapeshellarg( $rel )
-		);
-		@exec( $cmd, $out, $rc );
-		if ( $rc !== 0 || ! file_exists( $dest ) || filesize( $dest ) === 0 ) {
-			@unlink( $dest );
-			wds_pull_json( array( 'error' => 'zip failed', 'rc' => (int) $rc ), 500 );
+		$job = wds_job_id( 'zip', $rel );
+		$d   = wds_job_read( $job );
+		if ( $d && ( $d['state'] ?? '' ) === 'done' && ! empty( $d['file'] ) ) {
+			wds_pull_json( array( 'job' => $job, 'state' => 'done', 'file' => $d['file'], 'bytes' => $d['bytes'] ) );
 		}
-		wds_pull_json(
-			array(
-				'file'  => content_url( 'wdsnap/' . basename( $dest ) ),
-				'bytes' => filesize( $dest ),
-			)
-		);
+		if ( ! $d || wds_job_stale( $d ) ) {
+			wds_job_write( $job, array( 'state' => 'queued', 'kind' => 'zip', 'path' => $rel ) );
+			$d = wds_job_read( $job );
+		}
+		if ( ( $d['state'] ?? '' ) === 'queued' ) {
+			wds_pull_respond( array( 'job' => $job, 'state' => 'queued' ) );
+			wds_detach_and_build(
+				$job,
+				function ( $dd ) {
+					$job = wds_job_id( 'zip', $dd['path'] );
+					$snap_dir = WP_CONTENT_DIR . '/wdsnap';
+					$safe = preg_replace( '/[^a-zA-Z0-9_-]/', '_', $dd['path'] );
+					$dest = $snap_dir . '/' . $GLOBALS['WDS_TOKEN'] . '-' . $safe . '.zip';
+					@unlink( $dest );
+					$cmd = sprintf(
+						'cd %s && zip -rq -9 %s %s > /dev/null 2>&1',
+						escapeshellarg( WP_CONTENT_DIR ),
+						escapeshellarg( $dest ),
+						escapeshellarg( $dd['path'] )
+					);
+					@exec( $cmd, $out, $rc );
+					if ( $rc === 0 && file_exists( $dest ) && filesize( $dest ) > 0 ) {
+						wds_job_write( $job, array( 'state' => 'done', 'kind' => 'zip', 'path' => $dd['path'], 'file' => content_url( 'wdsnap/' . basename( $dest ) ), 'bytes' => filesize( $dest ) ) );
+					} else {
+						@unlink( $dest );
+						wds_job_write( $job, array( 'state' => 'error', 'kind' => 'zip', 'path' => $dd['path'], 'message' => 'zip failed', 'rc' => (int) $rc ) );
+					}
+				}
+			);
+		}
+		break;
+
+	case 'status':
+		// Poll a job. No building here — answers in ms.
+		$job = isset( $_GET['job'] ) ? (string) $_GET['job'] : '';
+		$d   = wds_job_read( $job );
+		if ( ! $d ) {
+			wds_pull_json( array( 'error' => 'unknown job' ), 404 );
+		}
+		$out = array( 'job' => $job, 'state' => $d['state'] ?? 'queued' );
+		foreach ( array( 'file', 'bytes', 'message', 'rc' ) as $k ) {
+			if ( isset( $d[ $k ] ) ) {
+				$out[ $k ] = $d[ $k ];
+			}
+		}
+		wds_pull_json( $out );
 		break;
 
 	case 'db':
+		// Queue a DB dump; answers immediately. Poll status, then download.
 		$mysqldump = trim( (string) @shell_exec( 'command -v mysqldump 2>/dev/null || which mysqldump 2>/dev/null' ) );
 		if ( $mysqldump === '' || ! function_exists( 'exec' ) ) {
 			wds_pull_json( array( 'error' => 'no mysqldump binary: dump the DB another way' ), 500 );
 		}
-		$dest = $snap_dir . '/' . $WDS_TOKEN . '-db.sql';
-		// DB_HOST may be host, host:port, or host:/socket/path (GridPane
-		// style). mysqldump does not accept host:socket in -h, so split it.
-		$mhost = DB_HOST;
-		$msock = '';
-		$mport = '';
-		if ( preg_match( '/^(.*?):(\/.*)$/', DB_HOST, $mm ) ) {
-			$mhost = $mm[1];
-			$msock = $mm[2];
-		} elseif ( preg_match( '/^(.*?):(\d+)$/', DB_HOST, $mm ) ) {
-			$mhost = $mm[1];
-			$mport = $mm[2];
+		$job = wds_job_id( 'db', DB_NAME );
+		$d   = wds_job_read( $job );
+		if ( $d && ( $d['state'] ?? '' ) === 'done' && ! empty( $d['file'] ) ) {
+			wds_pull_json( array( 'job' => $job, 'state' => 'done', 'file' => $d['file'], 'bytes' => $d['bytes'] ) );
 		}
-		$base = sprintf(
-			'%s --single-transaction --quick -h %s%s%s -u %s %s %s',
-			escapeshellarg( $mysqldump ),
-			escapeshellarg( $mhost ),
-			$msock !== '' ? ' --socket=' . escapeshellarg( $msock ) : '',
-			$mport !== '' ? ' -P' . (int) $mport : '',
-			escapeshellarg( DB_USER ),
-			DB_PASSWORD !== '' ? '-p' . escapeshellarg( DB_PASSWORD ) : '',
-			escapeshellarg( DB_NAME )
-		);
-		// Full flags first; limited-privilege users often lack ROUTINE/EVENT
-		// rights, so retry plain on failure.
-		// NOTE: stderr goes to a side file, NOT the dump: mariadb-dump prints
-		// a deprecation notice that would otherwise fail content validation.
-		$errf = $dest . '.err';
-		@exec( $base . ' --routines --events > ' . escapeshellarg( $dest ) . ' 2> ' . escapeshellarg( $errf ), $out, $rc );
-		if ( $rc !== 0 ) {
-			@exec( $base . ' > ' . escapeshellarg( $dest ) . ' 2> ' . escapeshellarg( $errf ), $out, $rc );
+		if ( ! $d || wds_job_stale( $d ) ) {
+			wds_job_write( $job, array( 'state' => 'queued', 'kind' => 'db', 'path' => DB_NAME ) );
+			$d = wds_job_read( $job );
 		}
-		@unlink( $errf );
-		$head = file_exists( $dest ) ? file_get_contents( $dest, false, null, 0, 2000 ) : '';
-		if ( $rc !== 0 || strpos( $head, 'CREATE TABLE' ) === false ) {
-			@unlink( $dest );
-			wds_pull_json( array( 'error' => 'mysqldump failed', 'rc' => (int) $rc ), 500 );
+		if ( ( $d['state'] ?? '' ) === 'queued' ) {
+			wds_pull_respond( array( 'job' => $job, 'state' => 'queued' ) );
+			wds_detach_and_build(
+				$job,
+				function ( $dd ) {
+					$job = wds_job_id( 'db', $dd['path'] );
+					$snap_dir = WP_CONTENT_DIR . '/wdsnap';
+					$dest = $snap_dir . '/' . $GLOBALS['WDS_TOKEN'] . '-db.sql';
+					$mhost = DB_HOST;
+					$msock = '';
+					$mport = '';
+					if ( preg_match( '/^(.*?):(\/.*)$/', DB_HOST, $mm ) ) {
+						$mhost = $mm[1];
+						$msock = $mm[2];
+					} elseif ( preg_match( '/^(.*?):(\d+)$/', DB_HOST, $mm ) ) {
+						$mhost = $mm[1];
+						$mport = $mm[2];
+					}
+					$mysqldump = trim( (string) @shell_exec( 'command -v mysqldump 2>/dev/null || which mysqldump 2>/dev/null' ) );
+					$base = sprintf(
+						'%s --single-transaction --quick -h %s%s%s -u %s %s %s',
+						escapeshellarg( $mysqldump ),
+						escapeshellarg( $mhost ),
+						$msock !== '' ? ' --socket=' . escapeshellarg( $msock ) : '',
+						$mport !== '' ? ' -P' . (int) $mport : '',
+						escapeshellarg( DB_USER ),
+						DB_PASSWORD !== '' ? '-p' . escapeshellarg( DB_PASSWORD ) : '',
+						escapeshellarg( DB_NAME )
+					);
+					$errf = $dest . '.err';
+					@exec( $base . ' --routines --events > ' . escapeshellarg( $dest ) . ' 2> ' . escapeshellarg( $errf ), $out, $rc );
+					if ( $rc !== 0 ) {
+						@exec( $base . ' > ' . escapeshellarg( $dest ) . ' 2> ' . escapeshellarg( $errf ), $out, $rc );
+					}
+					@unlink( $errf );
+					$head = file_exists( $dest ) ? file_get_contents( $dest, false, null, 0, 2000 ) : '';
+					if ( $rc === 0 && strpos( $head, 'CREATE TABLE' ) !== false ) {
+						wds_job_write( $job, array( 'state' => 'done', 'kind' => 'db', 'path' => $dd['path'], 'file' => content_url( 'wdsnap/' . basename( $dest ) ), 'bytes' => filesize( $dest ) ) );
+					} else {
+						@unlink( $dest );
+						wds_job_write( $job, array( 'state' => 'error', 'kind' => 'db', 'path' => $dd['path'], 'message' => 'mysqldump failed', 'rc' => (int) $rc ) );
+					}
+				}
+			);
 		}
-		wds_pull_json(
-			array(
-				'file'  => content_url( 'wdsnap/' . basename( $dest ) ),
-				'bytes' => filesize( $dest ),
-			)
-		);
 		break;
 
 	case 'cleanup':
