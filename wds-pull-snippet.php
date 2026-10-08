@@ -9,7 +9,7 @@
  * (installer refuses outside an actionable context, silently).
  * DELETE wp-content/mu-plugins/wds-pull.php + ?wds_action=cleanup after cutover.
  *
- * Source: https://github.com/presswizards/wds-pull
+ * Source: presswizards/wds-pull (public repo)
  */
 error_reporting( E_ALL & ~E_DEPRECATED & ~E_NOTICE );
 
